@@ -1,3 +1,4 @@
+
 const { Client, Collection, GatewayIntentBits, REST, Routes, Partials, Events, PermissionsBitField, EmbedBuilder } = require('discord.js');
 const { token } = require('./config.json');
 const fs = require('node:fs');
@@ -85,8 +86,9 @@ const client = new Client({
         GatewayIntentBits.MessageContent,   // Accessing message content (for AFK mentions and auto-return)
         GatewayIntentBits.GuildMembers,     // For GuildMemberAdd event (autorole) and fetching member info (user info command)
         GatewayIntentBits.GuildPresences,   // For user presence status (user info command)
+		GatewayIntentBits.GuildMessageReactions,
     ],
-    partials: [Partials.Message, Partials.Channel, Partials.GuildMember], // Important for GuildMemberAdd event and full member objects
+    partials: [Partials.Message, Partials.Channel, Partials.GuildMember, Partials.Reaction, Partials.User], // Important for GuildMemberAdd event and full member objects
 });
 
 // Create a collection to store your commands
@@ -126,182 +128,207 @@ for (const file of eventFiles) {
 }
 // --- END NEW EVENT LOADING ---
 
+// Event handlers
 client.once('ready', async () => {
+    const readyEvent = require('./events/botstatus.js');
+    readyEvent.execute(client);
+
     console.log(`Logged in as ${client.user.tag}!`);
 
-    // --- Command Deployment Logic ---
-    const rest = new REST().setToken(token);
-
+    // Register slash commands
     try {
-        console.log(`Started refreshing ${commandsForDeployment.length} application (/) commands.`);
+        console.log('Started refreshing application (/) commands.');
 
-        // Deploy GLOBAL commands (recommended for most bots)
-        const data = await rest.put(
+        const commands = [];
+        for (const command of client.commands.values()) {
+            commands.push(command.data.toJSON());
+        }
+
+        const rest = new REST().setToken(token);
+
+        await rest.put(
             Routes.applicationCommands(client.user.id),
-            { body: commandsForDeployment },
+            { body: commands },
         );
 
-        console.log(`Successfully reloaded ${data.length} application (/) commands globally.`);
+        console.log('Successfully reloaded application (/) commands globally.');
     } catch (error) {
-        console.error('Error deploying commands:', error);
+        console.error('Error refreshing commands:', error);
     }
 });
 
-// --- Listen for interactions (this is where slash commands and button interactions are handled) ---
+client.on('guildCreate', async guild => {
+    const guildCreateEvent = require('./events/guildCreate.js');
+    guildCreateEvent.execute(guild);
+});
+
+client.on('guildDelete', async guild => {
+    const guildDeleteEvent = require('./events/guildDelete.js');
+    guildDeleteEvent.execute(guild);
+});
+
 client.on(Events.InteractionCreate, async interaction => {
-    // Handle modal submissions
-    if (interaction.isModalSubmit()) {
-        if (interaction.customId === 'giveaway_setup') {
-            const giveawayCommand = client.commands.get('giveaway');
-            if (giveawayCommand) {
-                await giveawayCommand.handleModalSubmit(interaction);
-            }
-        }
-        return;
-    }
+	if (!interaction.isChatInputCommand()) return;
 
-    // Handle button interactions
-    if (interaction.isButton()) {
-        if (interaction.customId.startsWith('serverlist_')) {
-            const botCommand = client.commands.get('bot');
-            if (botCommand) {
-                await botCommand.handleServerListButtons(interaction);
-            }
-        }
-        if (interaction.customId === 'giveaway_enter') {
-            const giveawayCommand = client.commands.get('giveaway');
-            if (giveawayCommand) {
-                await giveawayCommand.handleGiveawayButton(interaction);
-            }
-        }
-        return;
-    }
+	const command = interaction.client.commands.get(interaction.commandName);
 
-    if (!interaction.isChatInputCommand()) return;
+	if (!command) {
+		console.error(`No command matching ${interaction.commandName} was found.`);
+		return;
+	}
 
-    // --- DM Check: Added this block ---
-    if (!interaction.guildId) { // interaction.guildId is null if the command is used in a DM
-        return interaction.reply({ content: '❌ Cannot use this command in Direct Messages. Please use it in a server.', ephemeral: true });
-    }
-    // --- End DM Check ---
-
-    const command = client.commands.get(interaction.commandName);
-
-    if (!command) {
-        console.error(`No command matching ${interaction.commandName} was found.`);
-        return;
-    }
-
-    try {
-        await command.execute(interaction);
-    } catch (error) {
-        console.error(error);
-        if (interaction.replied || interaction.deferred) {
-            await interaction.followUp({ content: 'There was an error while executing this command!', ephemeral: true });
-        } else {
-            await interaction.reply({ content: 'There was an error while executing this command!', ephemeral: true });
-        }
-    }
+	try {
+		await command.execute(interaction);
+	} catch (error) {
+		console.error(error);
+		if (interaction.replied || interaction.deferred) {
+			await interaction.followUp({ content: 'There was an error while executing this command!', ephemeral: true });
+		} else {
+			await interaction.reply({ content: 'There was an error while executing this command!', ephemeral: true });
+		}
+	}
 });
 
-// --- Listen for message creation (for AFK auto-return and mentions) ---
-client.on(Events.MessageCreate, async message => {
-    // Ignore messages from bots to prevent loops, and DMs
-    if (message.author.bot || !message.guild) return; 
+// Reaction Role Handler
+client.on(Events.MessageReactionAdd, async (reaction, user) => {
+	if (user.bot) return;
 
-    let afkData = readAfkDataForEvent();
+	// Handle partial reactions
+	if (reaction.partial) {
+		try {
+			await reaction.fetch();
+		} catch (error) {
+			console.error('Something went wrong when fetching the reaction:', error);
+			return;
+		}
+	}
 
-    // 1. Check if the message author is currently AFK (for automatic return)
-    const authorAfkIndex = afkData.users.findIndex(u => u.id === message.author.id);
-    if (authorAfkIndex !== -1) {
-        const afkEntry = afkData.users[authorAfkIndex];
-        const duration = formatDurationForEvent(Date.now() - new Date(afkEntry.timestamp).getTime());
+	const fs = require('fs');
+	const path = require('path');
+	const reactionRolesPath = path.join(__dirname, 'reactionroles.json');
 
-        afkData.users.splice(authorAfkIndex, 1);
-        writeAfkDataForEvent(afkData);
+	try {
+		if (!fs.existsSync(reactionRolesPath)) return;
 
-        try {
-            await message.channel.send(`👋 Welcome back, ${message.author}! You were AFK for ${duration}.`);
-        } catch (error) {
-            console.error(`Error sending AFK return message in guild ${message.guild?.name}:`, error);
-        }
-    }
+		const data = fs.readFileSync(reactionRolesPath, 'utf8');
+		const config = JSON.parse(data);
+		const guildId = reaction.message.guild.id;
+		const messageId = reaction.message.id;
 
-    // 2. Check if any mentioned users are AFK
-    for (const mentionedUser of message.mentions.users.values()) {
-        if (mentionedUser.bot) continue;
+		if (!config[guildId] || !config[guildId][messageId]) return;
 
-        const mentionedAfkEntry = afkData.users.find(u => u.id === mentionedUser.id);
-        if (mentionedAfkEntry) {
-            const duration = formatDurationForEvent(Date.now() - new Date(mentionedAfkEntry.timestamp).getTime());
-            try {
-                await message.reply({
-                    content: `\`${mentionedUser.tag}\` is currently AFK: \`${mentionedAfkEntry.reason}\` (AFK for ${duration})`,
-                    ephemeral: true
-                });
-            } catch (error) {
-                console.error(`Error sending AFK mention reply in guild ${message.guild?.name}:`, error);
-            }
-        }
-    }
+		const emojiKey = reaction.emoji.id || reaction.emoji.name;
+		const reactionData = config[guildId][messageId].reactions[emojiKey];
+
+		if (!reactionData) return;
+
+		const guild = reaction.message.guild;
+		const member = await guild.members.fetch(user.id);
+		const role = guild.roles.cache.get(reactionData.roleId);
+
+		if (!role) return;
+
+		if (!member.roles.cache.has(role.id)) {
+			await member.roles.add(role, 'Reaction role added');
+		}
+	} catch (error) {
+		console.error('Error handling reaction add:', error);
+	}
 });
 
-// --- Listen for new guild members (for Autorole) ---
-client.on(Events.GuildMemberAdd, async member => {
-    if (!member.guild || member.user.id === client.user.id) return;
+client.on(Events.MessageReactionRemove, async (reaction, user) => {
+	if (user.bot) return;
 
-    let config = readAutoroleConfigForEvent();
-    const guildSettings = getGuildSettingsForEvent(config, member.guild.id);
+	// Handle partial reactions
+	if (reaction.partial) {
+		try {
+			await reaction.fetch();
+		} catch (error) {
+			console.error('Something went wrong when fetching the reaction:', error);
+			return;
+		}
+	}
 
-    if (!guildSettings || (guildSettings.humans.length === 0 && guildSettings.bots.length === 0)) {
-        return;
-    }
+	const fs = require('fs');
+	const path = require('path');
+	const reactionRolesPath = path.join(__dirname, 'reactionroles.json');
 
-    const rolesToAssign = [];
-    if (member.user.bot) {
-        rolesToAssign.push(...guildSettings.bots);
-    } else {
-        rolesToAssign.push(...guildSettings.humans);
-    }
+	try {
+		if (!fs.existsSync(reactionRolesPath)) return;
 
-    const assignableRoles = rolesToAssign.filter(roleId => member.guild.roles.cache.has(roleId));
+		const data = fs.readFileSync(reactionRolesPath, 'utf8');
+		const config = JSON.parse(data);
+		const guildId = reaction.message.guild.id;
+		const messageId = reaction.message.id;
 
-    if (assignableRoles.length === 0) {
-        return;
-    }
+		if (!config[guildId] || !config[guildId][messageId]) return;
 
-    const botMember = member.guild.members.me;
-    if (!botHasPermissionsForEvent(botMember)) {
-        console.warn(`[AutoRole] Bot lacks "Manage Roles" permission in guild "${member.guild.name}" (${member.guild.id}). Cannot assign roles.`);
-        return;
-    }
+		const emojiKey = reaction.emoji.id || reaction.emoji.name;
+		const reactionData = config[guildId][messageId].reactions[emojiKey];
+
+		if (!reactionData) return;
+
+		const guild = reaction.message.guild;
+		const member = await guild.members.fetch(user.id);
+		const role = guild.roles.cache.get(reactionData.roleId);
+
+		if (!role) return;
+
+		if (member.roles.cache.has(role.id)) {
+			await member.roles.remove(role, 'Reaction role removed');
+		}
+	} catch (error) {
+		console.error('Error handling reaction remove:', error);
+	}
+});
+
+// Consolidated messageCreate handler
+client.on('messageCreate', async message => {
+    if (message.author.bot || !message.guild) return;
 
     try {
-        const validRolesForAssignment = assignableRoles.filter(roleId => {
-            const role = member.guild.roles.cache.get(roleId);
-            return role && role.position < botMember.roles.highest.position;
+        // Handle AFK system
+        const afkData = readAfkDataForEvent();
+        const afkUserId = message.author.id;
+
+        // Check if user is AFK and remove them
+        const userIndex = afkData.users.findIndex(user => user.userId === afkUserId);
+        if (userIndex !== -1) {
+            afkData.users.splice(userIndex, 1);
+            writeAfkDataForEvent(afkData);
+
+            const embed = new EmbedBuilder()
+                .setColor(0x00FF00)
+                .setDescription(`Welcome back ${message.author}! I removed your AFK status.`);
+
+            const reply = await message.reply({ embeds: [embed] });
+            setTimeout(() => reply.delete().catch(() => {}), 5000);
+        }
+
+        // Check for AFK mentions
+        message.mentions.users.forEach(mentionedUser => {
+            if (mentionedUser.bot) return;
+
+            const afkUser = afkData.users.find(user => user.userId === mentionedUser.id);
+            if (afkUser) {
+                const embed = new EmbedBuilder()
+                    .setColor(0xFFFF00)
+                    .setDescription(`${mentionedUser.username} is currently AFK: ${afkUser.reason}`)
+                    .setTimestamp(new Date(afkUser.timestamp));
+
+                message.reply({ embeds: [embed] });
+            }
         });
 
-        if (validRolesForAssignment.length > 0) {
-            await member.roles.add(validRolesForAssignment, 'Auto-role assignment for new member.');
-            console.log(`[AutoRole] Assigned roles to ${member.user.tag} (${member.id}) in ${member.guild.name}. Roles: ${validRolesForAssignment.join(', ')}`);
-        } else {
-            console.log(`[AutoRole] No assignable roles for ${member.user.tag} in ${member.guild.name} (roles might be too high or invalid).`);
-        }
-    } catch (error) {
-        console.error(`[AutoRole] Failed to assign roles to ${member.user.tag} (${member.id}) in ${member.guild.name}:`, error);
-    }
-});
-
-client.on('messageCreate', async message => {
-    try {
+        // Handle stick command
         const stickCommand = client.commands.get('stick');
-        if (stickCommand) {
+        if (stickCommand && stickCommand.handleMessage) {
             await stickCommand.handleMessage(message);
         }
 
+        // Handle automod command
         const automodCommand = client.commands.get('automod');
-        if (automodCommand) {
+        if (automodCommand && automodCommand.handleMessage) {
             await automodCommand.handleMessage(message);
         }
     } catch (error) {
@@ -309,55 +336,24 @@ client.on('messageCreate', async message => {
     }
 });
 
-// Handle new member joins
+// Consolidated guildMemberAdd handler
 client.on('guildMemberAdd', async (member) => {
-    const welcomeCommand = client.commands.get('welcome');
-    if (welcomeCommand && welcomeCommand.handleMemberJoin) {
-        await welcomeCommand.handleMemberJoin(member);
-    }
+    try {
+        // Handle welcome system
+        const welcomeCommand = client.commands.get('welcome');
+        if (welcomeCommand && welcomeCommand.handleMemberJoin) {
+            await welcomeCommand.handleMemberJoin(member);
+        }
 
-    const automodCommand = client.commands.get('automod');
-    if (automodCommand && automodCommand.handleMemberAdd) {
-        await automodCommand.handleMemberAdd(member);
+        // Handle automod system
+        const automodCommand = client.commands.get('automod');
+        if (automodCommand && automodCommand.handleMemberAdd) {
+            await automodCommand.handleMemberAdd(member);
+        }
+    } catch (error) {
+        console.error('Error in guildMemberAdd event:', error);
     }
 });
 
 // Log in to Discord with your client's token
 client.login(token);
-
-// Handle AFK system
-client.on(Events.MessageCreate, async (message) => {
-    if (message.author.bot || !message.guild) return;
-
-    const afkData = readAfkDataForEvent();
-    const afkUserId = message.author.id;
-
-    // Check if user is AFK and remove them
-    const userIndex = afkData.users.findIndex(user => user.userId === afkUserId);
-    if (userIndex !== -1) {
-        afkData.users.splice(userIndex, 1);
-        writeAfkDataForEvent(afkData);
-
-        const embed = new EmbedBuilder()
-            .setColor(0x00FF00)
-            .setDescription(`Welcome back ${message.author}! I removed your AFK status.`);
-
-        const reply = await message.reply({ embeds: [embed] });
-        setTimeout(() => reply.delete().catch(() => {}), 5000);
-    }
-
-    // Check for AFK mentions
-    message.mentions.users.forEach(mentionedUser => {
-        if (mentionedUser.bot) return;
-
-        const afkUser = afkData.users.find(user => user.userId === mentionedUser.id);
-        if (afkUser) {
-            const embed = new EmbedBuilder()
-                .setColor(0xFFFF00)
-                .setDescription(`${mentionedUser.username} is currently AFK: ${afkUser.reason}`)
-                .setTimestamp(new Date(afkUser.timestamp));
-
-            message.reply({ embeds: [embed] });
-        }
-    });
-});
